@@ -124,6 +124,7 @@ void updateLDRValue();  // Fungsi baru untuk baca LDR dengan filter
 void activateNightMode();    // Tambah deklarasi fungsi
 void deactivateNightMode();  // Tambah deklarasi fungsi
 
+/////
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);

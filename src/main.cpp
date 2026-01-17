@@ -15,9 +15,11 @@ Adafruit_MPU6050 mpu;
 float accelX = 0, accelY = 0, accelZ = 0;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
 
-// ==================== SERVO SETUP ====================
-const int SERVO_PIN = 27;
-const int SERVO_PWM_CHANNEL = 0;
+// ==================== SERVO SETUP (DUA SERVO) ====================
+const int SERVO_PIN_27 = 27;  // Servo di pin 27 (potensiometer)
+const int SERVO_PIN_23 = 23;  // Servo di pin 23 (tombol VP)
+const int SERVO_PWM_CHANNEL_27 = 0;  // Channel 0 untuk servo 27
+const int SERVO_PWM_CHANNEL_23 = 1;  // Channel 1 untuk servo 23
 const int SERVO_PWM_FREQ = 50;
 const int SERVO_PWM_RESOLUTION = 12;
 
@@ -26,6 +28,7 @@ const int POT_PIN = 14;
 const int LDR_PIN = 13;
 const int BUTTON_P3 = 35;
 const int BUTTON_S2 = 34;
+const int BUTTON_VP = 36;  // Tombol VP untuk servo 23
 
 // Traffic Light LEDs
 const int RED1_PIN = 19;
@@ -40,14 +43,15 @@ const int MODE_LEDS[4] = {32, 33, 25, 26};
 
 // ==================== CONSTANTS ====================
 const int MODE_COUNT = 4;
-const int DAY_NIGHT_THRESHOLD = 3000;
+const int DAY_NIGHT_THRESHOLD = 2500;  // DIUBAH dari 50 ke 1500
 const unsigned long BLINK_INTERVAL = 500;
-const unsigned long PEDESTRIAN_DURATION = 10000;
+const unsigned long PEDESTRIAN_DURATION = 5000;
 const unsigned long ALL_RED_DURATION = 2000;
 const unsigned long YELLOW_DURATION = 3000;
 const unsigned long DISPLAY_UPDATE_INTERVAL = 300;
 const unsigned long MPU_READ_INTERVAL = 100;
 const unsigned long BARRIER_CLOSE_DELAY = 4000;
+const unsigned long LDR_UPDATE_INTERVAL = 1000;  // Tambah interval LDR
 
 // ==================== GLOBAL VARIABLES ====================
 int currentMode = 0;
@@ -60,34 +64,47 @@ int greenPhaseDuration[4] = {5000, 7000, 10000, 15000};
 
 // Servo variables
 int currentPotValue = 0;
-bool isBarrierOpen = false;
+int currentAngle27 = 0;  // Sudut servo 27
+int currentAngle23 = 0;  // Sudut servo 23
+bool isBarrierOpen_23 = false;
+bool isBarrierOpen_27 = false;
 unsigned long barrierCloseTime = 0;
 
-// Traffic State
+// Traffic State - URUTAN YANG BENAR
 enum TrafficState {
-  GREEN1_RED2,
-  YELLOW1_RED2,
-  ALL_RED_TRANSITION,
-  RED1_GREEN2,
-  RED1_YELLOW2,
-  ALL_RED_TRANSITION_2,
-  PEDESTRIAN_CROSSING,
-  BARRIER_MODE,
-  WAIT_AFTER_BARRIER
+  ALL_RED_TRANSITION,     // 0: Semua merah (start)
+  YELLOW1_RED2,           // 1: Kuning 1, Merah 2
+  GREEN1_RED2,            // 2: Hijau 1, Merah 2
+  YELLOW1_RED2_2,         // 3: Kuning 1 lagi, Merah 2
+  ALL_RED_TRANSITION_2,   // 4: Semua merah (transisi)
+  RED1_YELLOW2,           // 5: Merah 1, Kuning 2
+  RED1_GREEN2,            // 6: Merah 1, Hijau 2
+  RED1_YELLOW2_2,         // 7: Merah 1, Kuning 2 lagi
+  PEDESTRIAN_CROSSING,    // 8
+  BARRIER_MODE,           // 9
+  WAIT_AFTER_BARRIER      // 10
 };
 
-TrafficState currentState = ALL_RED_TRANSITION;
+TrafficState currentState = ALL_RED_TRANSITION;  // Mulai dari semua merah
 unsigned long stateStartTime = 0;
 
 // Display update timing
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastMPURead = 0;
+unsigned long lastLDRCheck = 0;  // Tambah untuk LDR
+
+// LDR variables
+int ldrSmoothValue = 0;
+const int LDR_SAMPLES = 5;
+int ldrSamples[LDR_SAMPLES];
+int ldrSampleIndex = 0;
 
 // ==================== FUNCTION DECLARATIONS ====================
 void setupOLED();
 void setupMPU6050();
 void readMPU6050();
-void setServoAngle(int angle);
+void setServoAngle27(int angle);  // Servo 27
+void setServoAngle23(int angle);  // Servo 23
 void calibrateLDR();
 void checkNightMode();
 void readPotentiometer();
@@ -102,6 +119,10 @@ void printState();
 void updateDisplay();
 void handleBarrierMode();
 void handleWaitAfterBarrier();
+void controlServo23WithButton();  // Kontrol servo 23 dengan tombol
+void updateLDRValue();  // Fungsi baru untuk baca LDR dengan filter
+void activateNightMode();    // Tambah deklarasi fungsi
+void deactivateNightMode();  // Tambah deklarasi fungsi
 
 // ==================== SETUP ====================
 void setup() {
@@ -109,7 +130,9 @@ void setup() {
   delay(1000);
   
   Serial.println("=== TRAFFIC LIGHT WITH MPU6050 & OLED ===");
-  Serial.println("Integrated System with Pedestrian Crossing");
+  Serial.println("Dual Servo System: Pin 27 (Pot) & Pin 23 (Button)");
+  Serial.print("LDR Threshold: ");
+  Serial.println(DAY_NIGHT_THRESHOLD);
   
   // Setup I2C
   Wire.begin(21, 22);
@@ -136,38 +159,52 @@ void setup() {
   // Setup buttons
   pinMode(BUTTON_P3, INPUT_PULLUP);
   pinMode(BUTTON_S2, INPUT_PULLUP);
+  pinMode(BUTTON_VP, INPUT_PULLUP);
   
-  // Setup Servo
-  ledcSetup(SERVO_PWM_CHANNEL, SERVO_PWM_FREQ, SERVO_PWM_RESOLUTION);
-  ledcAttachPin(SERVO_PIN, SERVO_PWM_CHANNEL);
-  setServoAngle(0);
+  // Setup SERVO 27 (dikontrol potensiometer)
+  ledcSetup(SERVO_PWM_CHANNEL_27, SERVO_PWM_FREQ, SERVO_PWM_RESOLUTION);
+  ledcAttachPin(SERVO_PIN_27, SERVO_PWM_CHANNEL_27);
+  setServoAngle27(0);
+  
+  // Setup SERVO 23 (dikontrol tombol VP)
+  ledcSetup(SERVO_PWM_CHANNEL_23, SERVO_PWM_FREQ, SERVO_PWM_RESOLUTION);
+  ledcAttachPin(SERVO_PIN_23, SERVO_PWM_CHANNEL_23);
+  setServoAngle23(0);
+  
+  // Inisialisasi array LDR samples
+  for (int i = 0; i < LDR_SAMPLES; i++) {
+    ldrSamples[i] = analogRead(LDR_PIN);
+  }
   
   // Kalibrasi
   calibrateLDR();
   
-  // Inisialisasi
-  setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
+  // Inisialisasi traffic light
+  currentState = ALL_RED_TRANSITION;
+  stateStartTime = millis();
+  setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);  // Semua merah
   digitalWrite(MODE_LEDS[0], HIGH);
   
-  // Baca nilai awal potentiometer
+  // Baca nilai awal potentiometer untuk servo 27
   currentPotValue = analogRead(POT_PIN);
-  setServoAngle(map(currentPotValue, 0, 4095, 0, 180));
-  
-  stateStartTime = millis();
+  currentAngle27 = map(currentPotValue, 0, 4095, 0, 180);
+  setServoAngle27(currentAngle27);
   
   // Display startup message
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println("Integrated System");
-  display.println("MPU6050 + OLED");
-  display.println("Pedestrian Ready");
+  display.println("Traffic System Ready");
+  display.print("LDR Th: ");
+  display.println(DAY_NIGHT_THRESHOLD);
+  display.println("Starting ALL RED");
   display.display();
   
   delay(2000);
   
   Serial.println("System initialized");
+  Serial.println("Starting from: ALL RED");
   printState();
 }
 
@@ -191,25 +228,83 @@ void setupMPU6050() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 }
 
-// ==================== SERVO FUNCTION ====================
-void setServoAngle(int angle) {
+// ==================== SERVO FUNCTIONS ====================
+void setServoAngle27(int angle) {
   if (angle < 0) angle = 0;
   if (angle > 180) angle = 180;
   
   int pulseWidth = map(angle, 0, 180, 500, 2500);
   int duty = (pulseWidth * 4095) / 20000;
-  ledcWrite(SERVO_PWM_CHANNEL, duty);
+  ledcWrite(SERVO_PWM_CHANNEL_27, duty);
   
-  // Update barrier state
+  currentAngle27 = angle;
+  
+  // Update barrier state untuk servo 27
   bool newBarrierOpen = (angle > 120);
-  if (newBarrierOpen != isBarrierOpen) {
-    isBarrierOpen = newBarrierOpen;
-    Serial.print("Barrier: ");
-    Serial.println(isBarrierOpen ? "OPEN" : "CLOSED");
-    if (!isBarrierOpen) {
+  if (newBarrierOpen != isBarrierOpen_27) {
+    isBarrierOpen_27 = newBarrierOpen;
+    Serial.print("Servo 27: ");
+    Serial.print(isBarrierOpen_27 ? "OPEN" : "CLOSED");
+    Serial.print(" (");
+    Serial.print(angle);
+    Serial.println("°)");
+  }
+}
+
+void setServoAngle23(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  
+  int pulseWidth = map(angle, 0, 180, 500, 2500);
+  int duty = (pulseWidth * 4095) / 20000;
+  ledcWrite(SERVO_PWM_CHANNEL_23, duty);
+  
+  currentAngle23 = angle;
+  
+  // Update barrier state untuk servo 23
+  bool newBarrierOpen = (angle > 120);
+  if (newBarrierOpen != isBarrierOpen_23) {
+    isBarrierOpen_23 = newBarrierOpen;
+    Serial.print("Servo 23: ");
+    Serial.print(isBarrierOpen_23 ? "OPEN" : "CLOSED");
+    Serial.print(" (");
+    Serial.print(angle);
+    Serial.println("°)");
+    if (!isBarrierOpen_23) {
       barrierCloseTime = millis();
     }
   }
+}
+
+void controlServo23WithButton() {
+  static bool lastVPState = HIGH;
+  static bool servo23State = false;  // false = tutup (0°), true = buka (180°)
+  static unsigned long lastPressTime = 0;
+  
+  unsigned long currentTime = millis();
+  
+  // Debouncing
+  if (currentTime - lastPressTime < 300) return;
+  
+  bool vpState = digitalRead(BUTTON_VP);
+  
+  // Jika tombol ditekan (LOW)
+  if (vpState == LOW && lastVPState == HIGH) {
+    lastPressTime = currentTime;
+    
+    // Toggle servo 23 state
+    servo23State = !servo23State;
+    
+    if (servo23State) {
+      setServoAngle23(180);  // Buka servo 23 (180°)
+      Serial.println("VP Button: Servo 23 OPENED (180°)");
+    } else {
+      setServoAngle23(0);   // Tutup servo 23 (0°)
+      Serial.println("VP Button: Servo 23 CLOSED (0°)");
+    }
+  }
+  
+  lastVPState = vpState;
 }
 
 // ==================== MPU6050 READING ====================
@@ -226,6 +321,184 @@ void readMPU6050() {
   gyroZ = g.gyro.z;
 }
 
+// ==================== LDR FUNCTIONS ====================
+void updateLDRValue() {
+  // Baca LDR dan simpan dalam array untuk smoothing
+  ldrSamples[ldrSampleIndex] = analogRead(LDR_PIN);
+  ldrSampleIndex = (ldrSampleIndex + 1) % LDR_SAMPLES;
+  
+  // Hitung rata-rata
+  long total = 0;
+  for (int i = 0; i < LDR_SAMPLES; i++) {
+    total += ldrSamples[i];
+  }
+  ldrSmoothValue = total / LDR_SAMPLES;
+}
+
+void calibrateLDR() {
+  Serial.println("=== LDR CALIBRATION ===");
+  delay(1000);
+  
+  // Baca 20 sample untuk rata-rata
+  long total = 0;
+  for (int i = 0; i < 20; i++) {
+    total += analogRead(LDR_PIN);
+    delay(50);
+  }
+  int avgLDR = total / 20;
+  
+  Serial.print("LDR Average: ");
+  Serial.println(avgLDR);
+  Serial.print("Threshold: ");
+  Serial.println(DAY_NIGHT_THRESHOLD);
+  Serial.print("Status: ");
+  Serial.println(avgLDR > DAY_NIGHT_THRESHOLD ? "NIGHT (gelap)" : "DAY (terang)");
+  
+  // Tampilkan di OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("LDR Calibration");
+  display.print("Avg: ");
+  display.println(avgLDR);
+  display.print("Thresh: ");
+  display.println(DAY_NIGHT_THRESHOLD);
+  display.print("Status: ");
+  display.println(avgLDR > DAY_NIGHT_THRESHOLD ? "NIGHT" : "DAY");
+  display.display();
+  delay(3000);
+}
+
+void checkNightMode() {
+  static unsigned long lastCheck = 0;
+  static unsigned long lastDebug = 0;
+  
+  unsigned long currentTime = millis();
+  
+  // Update nilai LDR setiap 100ms
+  if (currentTime - lastCheck >= 100) {
+    updateLDRValue();
+    lastCheck = currentTime;
+  }
+  
+  // Debug info setiap 3 detik
+  if (currentTime - lastDebug >= 3000) {
+    Serial.println("=== LDR STATUS ===");
+    Serial.print("LDR Value: ");
+    Serial.print(ldrSmoothValue);
+    Serial.print(" | Threshold: ");
+    Serial.println(DAY_NIGHT_THRESHOLD);
+    Serial.print("Interpretation: ");
+    
+    if (ldrSmoothValue < 2000) {
+      Serial.println("SANGAT GELAP (malam)");
+    } else if (ldrSmoothValue < 2500) {
+      Serial.println("GELAP (sore/malam)");
+    } else if (ldrSmoothValue < 3000) {
+      Serial.println("TERANG (siang)");
+    } else {
+      Serial.println("SANGAT TERANG (siang terik)");
+    }
+    
+    Serial.print("Night Mode: ");
+    Serial.println(isNightMode ? "ACTIVE" : "INACTIVE");
+    Serial.println("=================");
+    lastDebug = currentTime;
+  }
+  
+  // LOGIKA DIBALIK: 
+  // Jika LDR < threshold = GELAP = NIGHT MODE
+  // Jika LDR > threshold = TERANG = DAY MODE
+  bool nightDetected = (ldrSmoothValue < DAY_NIGHT_THRESHOLD);
+  
+  // Hysteresis untuk mencegah flickering
+  static bool lastDetection = nightDetected;
+  static unsigned long lastChangeTime = 0;
+  
+  if (nightDetected != lastDetection) {
+    if (currentTime - lastChangeTime > 2000) { // Tunggu 2 detik stabil
+      if (nightDetected && !isNightMode) {
+        // Aktifkan NIGHT MODE (gelap)
+        activateNightMode();
+      } 
+      else if (!nightDetected && isNightMode) {
+        // Aktifkan DAY MODE (terang)
+        deactivateNightMode();
+      }
+      lastChangeTime = currentTime;
+      lastDetection = nightDetected;
+    }
+  } else {
+    lastChangeTime = currentTime;
+  }
+}
+
+// Fungsi untuk mengaktifkan night mode
+void activateNightMode() {
+  isNightMode = true;
+  pedestrianRequest = false;
+  
+  Serial.println("=== NIGHT MODE ACTIVATED ===");
+  Serial.print("LDR Value: ");
+  Serial.println(ldrSmoothValue);
+  Serial.println("Reason: LDR < threshold (GELAP)");
+  
+  // Matikan semua LED mode indicator
+  for (int i = 0; i < MODE_COUNT; i++) {
+    digitalWrite(MODE_LEDS[i], LOW);
+  }
+  
+  // Set semua traffic light ke kuning blink
+  yellowState = true;
+  setLights(LOW, yellowState, LOW, LOW, yellowState, LOW);
+  lastBlinkTime = millis();
+  
+  // Tampilkan di OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("NIGHT MODE");
+  display.println("Yellow Blink");
+  display.print("LDR: ");
+  display.println(ldrSmoothValue);
+  display.print("Status: GELAP");
+  display.display();
+  delay(2000);
+}
+
+// Fungsi untuk mengaktifkan day mode  
+void deactivateNightMode() {
+  isNightMode = false;
+  
+  Serial.println("=== DAY MODE ACTIVATED ===");
+  Serial.print("LDR Value: ");
+  Serial.println(ldrSmoothValue);
+  Serial.println("Reason: LDR > threshold (TERANG)");
+  
+  // Kembali ke traffic normal
+  currentState = ALL_RED_TRANSITION;
+  stateStartTime = millis();
+  setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
+  updateModeLEDs();
+  
+  // Tampilkan di OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("DAY MODE");
+  display.println("Normal Operation");
+  display.print("LDR: ");
+  display.println(ldrSmoothValue);
+  display.print("Status: TERANG");
+  display.display();
+  delay(2000);
+  
+  printState();
+}
+
+
 // ==================== MAIN LOOP ====================
 void loop() {
   unsigned long currentTime = millis();
@@ -235,65 +508,72 @@ void loop() {
     readMPU6050();
     lastMPURead = currentTime;
   }
+
+  // 2. Check night mode (dipanggil setiap loop)
+  checkNightMode();
+
+  // 3. Kontrol servo 23 dengan tombol VP
+  controlServo23WithButton();
   
-  // 2. Handle potentiometer untuk servo
+  // 4. Kontrol servo 27 dengan potensiometer
   static unsigned long lastPotRead = 0;
   if (currentTime - lastPotRead >= 50) {
     int potValue = analogRead(POT_PIN);
     if (abs(potValue - currentPotValue) > 10) {
       currentPotValue = potValue;
-      setServoAngle(map(potValue, 0, 4095, 0, 180));
+      int angle = map(potValue, 0, 4095, 0, 180);
+      setServoAngle27(angle);
     }
     lastPotRead = currentTime;
   }
   
-  // 3. Check night mode
-  checkNightMode();
-  
-  // 4. Read potentiometer for mode
+  // 5. Read potentiometer for mode
   readPotentiometer();
   
-  // 5. Check buttons (jika bukan night mode)
+  // 6. Check buttons (jika bukan night mode)
   if (!isNightMode) {
     checkButtons();
   }
   
-  // 6. Handle pedestrian request
+  // 7. Handle pedestrian request
   if (pedestrianRequest) {
     handlePedestrianRequest();
   }
   
-  // 7. Update display
+  // 8. Update display
   if (currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     updateDisplay();
     lastDisplayUpdate = currentTime;
   }
   
-  // 8. Main traffic logic
+  // 9. Main traffic logic
   if (isNightMode) {
     nightModeOperation();
   } else {
     // Check barrier mode
-    if (isBarrierOpen && currentState != BARRIER_MODE && 
-        currentState != PEDESTRIAN_CROSSING && currentState != WAIT_AFTER_BARRIER) {
-      currentState = BARRIER_MODE;
-      stateStartTime = currentTime;
-      Serial.println("BARRIER OPEN - Entering barrier mode");
-    }
-    
-    switch(currentState) {
-      case BARRIER_MODE:
-        handleBarrierMode();
-        break;
-      case WAIT_AFTER_BARRIER:
-        handleWaitAfterBarrier();
-        break;
-      case PEDESTRIAN_CROSSING:
-        // Ditangani di handlePedestrianRequest()
-        break;
-      default:
-        normalModeOperation();
-        break;
+    if (isBarrierOpen_27) {
+      // Jika barrier terbuka, PASTIKAN di BARRIER_MODE
+      if (currentState != BARRIER_MODE && currentState != WAIT_AFTER_BARRIER) {
+        currentState = BARRIER_MODE;
+        stateStartTime = millis();
+        Serial.println("BARRIER OPEN - Switching to BARRIER MODE (All Red)");
+        setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);  // Langsung semua merah
+      }
+    } else {
+      // Barrier tertutup, jalankan traffic normal
+      switch(currentState) {
+        case BARRIER_MODE:
+          handleBarrierMode();
+          break;
+        case WAIT_AFTER_BARRIER:
+          handleWaitAfterBarrier();
+          break;
+        case PEDESTRIAN_CROSSING:
+          break;
+        default:
+          normalModeOperation();
+          break;
+      }
     }
   }
   
@@ -313,47 +593,17 @@ void setLights(int red1, int yellow1, int green1, int red2, int yellow2, int gre
 void printState() {
   Serial.print("State: ");
   switch(currentState) {
-    case GREEN1_RED2: Serial.println("GREEN 1 - RED 2"); break;
+    case ALL_RED_TRANSITION: Serial.println("ALL RED (Start)"); break;
     case YELLOW1_RED2: Serial.println("YELLOW 1 - RED 2"); break;
-    case ALL_RED_TRANSITION: Serial.println("ALL RED (transition)"); break;
-    case RED1_GREEN2: Serial.println("RED 1 - GREEN 2"); break;
+    case GREEN1_RED2: Serial.println("GREEN 1 - RED 2"); break;
+    case YELLOW1_RED2_2: Serial.println("YELLOW 1 (2) - RED 2"); break;
+    case ALL_RED_TRANSITION_2: Serial.println("ALL RED (Transition)"); break;
     case RED1_YELLOW2: Serial.println("RED 1 - YELLOW 2"); break;
-    case ALL_RED_TRANSITION_2: Serial.println("ALL RED (transition 2)"); break;
+    case RED1_GREEN2: Serial.println("RED 1 - GREEN 2"); break;
+    case RED1_YELLOW2_2: Serial.println("RED 1 - YELLOW 2 (2)"); break;
     case PEDESTRIAN_CROSSING: Serial.println("PEDESTRIAN CROSSING"); break;
     case BARRIER_MODE: Serial.println("BARRIER MODE"); break;
     case WAIT_AFTER_BARRIER: Serial.println("WAIT AFTER BARRIER"); break;
-  }
-}
-
-void calibrateLDR() {
-  Serial.println("LDR Calibration...");
-  delay(500);
-  Serial.print("Initial LDR: ");
-  Serial.println(analogRead(LDR_PIN));
-}
-
-void checkNightMode() {
-  int ldrValue = analogRead(LDR_PIN);
-  bool nightDetected = (ldrValue > DAY_NIGHT_THRESHOLD);
-  
-  if (nightDetected && !isNightMode) {
-    isNightMode = true;
-    pedestrianRequest = false;
-    Serial.println("=== NIGHT MODE (Yellow Blink) ===");
-    setLights(LOW, LOW, LOW, LOW, LOW, LOW);
-    
-    for (int i = 0; i < MODE_COUNT; i++) {
-      digitalWrite(MODE_LEDS[i], LOW);
-    }
-  } 
-  else if (!nightDetected && isNightMode) {
-    isNightMode = false;
-    Serial.println("=== DAY MODE ===");
-    currentState = ALL_RED_TRANSITION;
-    stateStartTime = millis();
-    setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
-    digitalWrite(MODE_LEDS[currentMode], HIGH);
-    printState();
   }
 }
 
@@ -389,18 +639,29 @@ void checkButtons() {
   bool s2State = digitalRead(BUTTON_S2);
   bool p3State = digitalRead(BUTTON_P3);
   
-  // Button S2 - Pedestrian
+  // Button S2 - Pedestrian (INSTANT dengan lampu merah)
   if (s2State == LOW && lastS2State == HIGH) {
-    Serial.println("Button S2: Pedestrian Request");
+    Serial.println("Button S2: INSTANT Pedestrian Request");
+    
+    // Langsung set semua lampu merah
+    setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
+    
     if (!pedestrianRequest) {
       pedestrianRequest = true;
       pedestrianRequestTime = millis();
+      
+      // Langsung masuk ke state pedestrian crossing
+      if (currentState != PEDESTRIAN_CROSSING) {
+        currentState = PEDESTRIAN_CROSSING;
+        stateStartTime = millis();
+        Serial.println("=== PEDESTRIAN CROSSING ACTIVATED ===");
+      }
     }
   }
   
-  // Button P3 - Emergency
+  // Button P3 - Emergency (INSTANT)
   if (p3State == LOW && lastP3State == HIGH) {
-    Serial.println("Button P3: Emergency Stop");
+    Serial.println("Button P3: INSTANT Emergency Stop");
     emergencyStop();
   }
   
@@ -409,25 +670,29 @@ void checkButtons() {
 }
 
 void emergencyStop() {
-  Serial.println("!!! EMERGENCY - ALL RED !!!");
+  Serial.println("!!! INSTANT EMERGENCY - ALL RED NOW !!!");
   setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
-  delay(3000);
   
+  // Reset semua state
+  pedestrianRequest = false;
+  
+  // Kembali ke state awal
   currentState = ALL_RED_TRANSITION;
   stateStartTime = millis();
-  Serial.println("Emergency cleared");
+  
+  Serial.println("Emergency activated - Starting from ALL RED");
   printState();
 }
 
 void handlePedestrianRequest() {
   if (currentState != PEDESTRIAN_CROSSING) {
     currentState = PEDESTRIAN_CROSSING;
-    Serial.println("=== PEDESTRIAN CROSSING ===");
-    setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
+    Serial.println("=== PEDESTRIAN CROSSING STARTED ===");
+    setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);  // Langsung semua merah
     stateStartTime = millis();
   }
   
-  // Cek waktu (10 detik)
+  // Cek waktu (5 detik)
   if (millis() - pedestrianRequestTime >= PEDESTRIAN_DURATION) {
     Serial.println("Pedestrian crossing finished");
     pedestrianRequest = false;
@@ -445,114 +710,166 @@ void updateModeLEDs() {
 }
 
 void nightModeOperation() {
-  if (millis() - lastBlinkTime >= BLINK_INTERVAL) {
+  if (!isNightMode) {
+    return;
+  }
+  
+  unsigned long currentTime = millis();
+  
+  // Blink kuning setiap BLINK_INTERVAL
+  if (currentTime - lastBlinkTime >= BLINK_INTERVAL) {
     yellowState = !yellowState;
     setLights(LOW, yellowState, LOW, LOW, yellowState, LOW);
-    lastBlinkTime = millis();
+    lastBlinkTime = currentTime;
   }
 }
 
 void normalModeOperation() {
-  if (pedestrianRequest) return;
+  if (pedestrianRequest || isBarrierOpen_27) {
+    return;
+  }
   
   unsigned long currentTime = millis();
   unsigned long elapsed = currentTime - stateStartTime;
   
+  // Debug state setiap 2 detik
+  static unsigned long lastDebugTime = 0;
+  if (currentTime - lastDebugTime > 2000) {
+    Serial.print("Traffic State: ");
+    printState();
+    Serial.print("Elapsed: ");
+    Serial.println(elapsed);
+    lastDebugTime = currentTime;
+  }
+  
   switch (currentState) {
-    case GREEN1_RED2:
-      setLights(LOW, LOW, HIGH, HIGH, LOW, LOW);
+    case ALL_RED_TRANSITION:  // 0: SEMUA MERAH (Start)
+      setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
       
-      if (elapsed >= greenPhaseDuration[currentMode]) {
-        currentState = YELLOW1_RED2;
+      if (elapsed >= ALL_RED_DURATION) {  // 2 detik
+        currentState = YELLOW1_RED2;  // Ke KUNING
         stateStartTime = currentTime;
-        Serial.println("Green phase ended, switching to YELLOW");
+        Serial.println("Switching to YELLOW 1");
         printState();
       }
       break;
       
-    case YELLOW1_RED2:
+    case YELLOW1_RED2:  // 1: KUNING 1, MERAH 2
       setLights(LOW, HIGH, LOW, HIGH, LOW, LOW);
       
-      if (elapsed >= YELLOW_DURATION) {
-        currentState = ALL_RED_TRANSITION;
+      if (elapsed >= YELLOW_DURATION) {  // 3 detik
+        currentState = GREEN1_RED2;  // Ke HIJAU
         stateStartTime = currentTime;
-        Serial.println("Yellow ended, ALL RED for safety");
+        Serial.println("Switching to GREEN 1");
         printState();
       }
       break;
       
-    case ALL_RED_TRANSITION:
+    case GREEN1_RED2:  // 2: HIJAU 1, MERAH 2
+      setLights(LOW, LOW, HIGH, HIGH, LOW, LOW);
+      
+      if (elapsed >= greenPhaseDuration[currentMode]) {  // 5-15 detik
+        currentState = YELLOW1_RED2_2;  // Ke KUNING lagi
+        stateStartTime = currentTime;
+        Serial.println("Green ended, switching to YELLOW");
+        printState();
+      }
+      break;
+      
+    case YELLOW1_RED2_2:  // 3: KUNING 1 lagi, MERAH 2
+      setLights(LOW, HIGH, LOW, HIGH, LOW, LOW);
+      
+      if (elapsed >= YELLOW_DURATION) {  // 3 detik
+        currentState = ALL_RED_TRANSITION_2;  // Ke SEMUA MERAH
+        stateStartTime = currentTime;
+        Serial.println("Yellow ended, ALL RED");
+        printState();
+      }
+      break;
+      
+    case ALL_RED_TRANSITION_2:  // 4: SEMUA MERAH (transisi)
       setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
       
-      if (elapsed >= ALL_RED_DURATION) {
-        currentState = RED1_GREEN2;
+      if (elapsed >= ALL_RED_DURATION) {  // 2 detik
+        currentState = RED1_YELLOW2;  // Ke KUNING 2
         stateStartTime = currentTime;
-        Serial.println("Now Traffic Light 2 gets GREEN");
+        Serial.println("Switching to YELLOW 2");
         printState();
       }
       break;
       
-    case RED1_GREEN2:
-      setLights(HIGH, LOW, LOW, LOW, LOW, HIGH);
-      
-      if (elapsed >= greenPhaseDuration[currentMode]) {
-        currentState = RED1_YELLOW2;
-        stateStartTime = currentTime;
-        Serial.println("Green phase 2 ended, switching to YELLOW");
-        printState();
-      }
-      break;
-      
-    case RED1_YELLOW2:
+    case RED1_YELLOW2:  // 5: MERAH 1, KUNING 2
       setLights(HIGH, LOW, LOW, LOW, HIGH, LOW);
       
-      if (elapsed >= YELLOW_DURATION) {
-        currentState = ALL_RED_TRANSITION_2;
+      if (elapsed >= YELLOW_DURATION) {  // 3 detik
+        currentState = RED1_GREEN2;  // Ke HIJAU 2
         stateStartTime = currentTime;
-        Serial.println("Yellow 2 ended, ALL RED for safety");
+        Serial.println("Switching to GREEN 2");
         printState();
       }
       break;
       
-    case ALL_RED_TRANSITION_2:
-      setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
+    case RED1_GREEN2:  // 6: MERAH 1, HIJAU 2
+      setLights(HIGH, LOW, LOW, LOW, LOW, HIGH);
       
-      if (elapsed >= ALL_RED_DURATION) {
-        currentState = GREEN1_RED2;
+      if (elapsed >= greenPhaseDuration[currentMode]) {  // 5-15 detik
+        currentState = RED1_YELLOW2_2;  // Ke KUNING 2 lagi
         stateStartTime = currentTime;
-        Serial.println("Cycle complete, back to Traffic Light 1 GREEN");
+        Serial.println("Green 2 ended, switching to YELLOW");
         printState();
       }
       break;
       
-    case PEDESTRIAN_CROSSING:
-      // Ditangani di handlePedestrianRequest()
+    case RED1_YELLOW2_2:  // 7: MERAH 1, KUNING 2 lagi
+      setLights(HIGH, LOW, LOW, LOW, HIGH, LOW);
+      
+      if (elapsed >= YELLOW_DURATION) {  // 3 detik
+        currentState = ALL_RED_TRANSITION;  // Kembali ke awal
+        stateStartTime = currentTime;
+        Serial.println("Cycle complete, back to ALL RED");
+        printState();
+      }
+      break;
+      
+    default:
+      currentState = ALL_RED_TRANSITION;
+      stateStartTime = currentTime;
+      Serial.println("Unknown state, resetting to ALL RED");
       break;
   }
 }
 
 void handleBarrierMode() {
+  // Selama barrier terbuka: SEMUA LAMPU MERAH
   setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
   
-  if (!isBarrierOpen && barrierCloseTime == 0) {
-    barrierCloseTime = millis();
+  // Cek jika barrier sudah ditutup
+  if (!isBarrierOpen_27) {
+    Serial.println("Barrier closed - switching to WAIT_AFTER_BARRIER");
     currentState = WAIT_AFTER_BARRIER;
-    Serial.println("Barrier closed, waiting 4 seconds...");
+    stateStartTime = millis();
+    barrierCloseTime = millis();
   }
 }
 
 void handleWaitAfterBarrier() {
+  // Tetap merah selama 4 detik setelah barrier tutup
   setLights(HIGH, LOW, LOW, HIGH, LOW, LOW);
   
+  // Tunggu 4 detik, lalu kembali ke siklus normal
   if (millis() - barrierCloseTime >= BARRIER_CLOSE_DELAY) {
-    barrierCloseTime = 0;
+    Serial.println("Wait finished - returning to normal traffic cycle");
+    
+    // Kembali ke awal siklus traffic
     currentState = ALL_RED_TRANSITION;
     stateStartTime = millis();
-    Serial.println("Returning to normal traffic cycle");
+    barrierCloseTime = 0;
+    
+    printState();
   }
 }
 
-// ==================== DISPLAY FUNCTION WITH XYZ ====================
+// ==================== DISPLAY FUNCTION ====================
 void updateDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -561,9 +878,22 @@ void updateDisplay() {
   // Line 1: System Status
   display.setCursor(0, 0);
   display.print("S:");
-  const char* states[] = {"G1R2","Y1R2","TR1","R1G2","R1Y2","TR2","PED","BAR","WAIT"};
+  const char* states[] = {
+    "AR",    // ALL_RED_TRANSITION
+    "Y1R2",  // YELLOW1_RED2
+    "G1R2",  // GREEN1_RED2
+    "Y1R2",  // YELLOW1_RED2_2
+    "AR2",   // ALL_RED_TRANSITION_2
+    "R1Y2",  // RED1_YELLOW2
+    "R1G2",  // RED1_GREEN2
+    "R1Y2",  // RED1_YELLOW2_2
+    "PED",   // PEDESTRIAN_CROSSING
+    "BAR",   // BARRIER_MODE
+    "WAIT"   // WAIT_AFTER_BARRIER
+  };
+  
   int stateIdx = currentState;
-  if (stateIdx < 9) {
+  if (stateIdx < 11) {
     display.print(states[stateIdx]);
   }
   
@@ -572,32 +902,37 @@ void updateDisplay() {
   display.print(" N:");
   display.print(isNightMode ? "Y" : "N");
   
-  // Line 2: Potentiometer & Barrier
+  // Line 2: LDR Status
   display.setCursor(0, 10);
-  display.print("Pot:");
-  display.print(currentPotValue);
-  display.print(" B:");
-  display.print(isBarrierOpen ? "OPEN" : "CLOSED");
+  display.print("LDR:");
+  display.print(ldrSmoothValue);
+  display.print("/");
+  display.print(DAY_NIGHT_THRESHOLD);
+  display.print(" ");
+  display.print(isNightMode ? "NIGHT" : "DAY");
   
-  // Line 3: MPU6050 Accelerometer X
+  // Line 3: Servo Status
   display.setCursor(0, 20);
+  display.print("S27:");
+  display.print(isBarrierOpen_27 ? "OPEN" : "CLOSED");
+  display.print(" A:");
+  display.print(currentAngle27);
+  
+  // Line 4: Servo 23 Status
+  display.setCursor(0, 30);
+  display.print("S23:");
+  display.print(isBarrierOpen_23 ? "OPEN" : "CLOSED");
+  
+  // Line 5: MPU6050 & Buttons
+  display.setCursor(0, 40);
   display.print("X:");
   display.print(accelX, 1);
-  display.print(" m/s²");
+  display.print(" S2:");
+  display.print(digitalRead(BUTTON_S2) == LOW ? "P" : "_");
+  display.print(" P3:");
+  display.print(digitalRead(BUTTON_P3) == LOW ? "P" : "_");
   
-  // Line 4: MPU6050 Accelerometer Y
-  display.setCursor(0, 30);
-  display.print("Y:");
-  display.print(accelY, 1);
-  display.print(" m/s²");
-  
-  // Line 5: MPU6050 Accelerometer Z
-  display.setCursor(0, 40);
-  display.print("Z:");
-  display.print(accelZ, 1);
-  display.print(" m/s²");
-  
-  // Line 6: Pedestrian Status & Green Time
+  // Line 6: Pedestrian Status
   display.setCursor(0, 50);
   display.print("Ped:");
   if (pedestrianRequest) {
@@ -607,10 +942,6 @@ void updateDisplay() {
   } else {
     display.print("READY");
   }
-  
-  display.print(" G:");
-  display.print(greenPhaseDuration[currentMode] / 1000);
-  display.print("s");
   
   display.display();
 }
